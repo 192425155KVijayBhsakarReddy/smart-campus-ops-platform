@@ -3,7 +3,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import campus_model as m
+import campus_model as m  # noqa: E402
 
 
 # ---- Unit checks

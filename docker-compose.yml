@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: campus_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: campus_db
+      POSTGRES_USER: campus_user
+      POSTGRES_PASSWORD: campus_secure_pass_2026
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campus_user -d campus_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smartcampus-net
+
+  backend-1:
+    build: ./backend
+    container_name: campus_backend_1
+    restart: unless-stopped
+    environment:
+      DJANGO_DEBUG: "False"
+      DJANGO_SECRET_KEY: "prod-secret-key-smart-campus-192425155"
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: campus_db
+      DB_USER: campus_user
+      DB_PASSWORD: campus_secure_pass_2026
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - smartcampus-net
+
+  backend-2:
+    build: ./backend
+    container_name: campus_backend_2
+    restart: unless-stopped
+    environment:
+      DJANGO_DEBUG: "False"
+      DJANGO_SECRET_KEY: "prod-secret-key-smart-campus-192425155"
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: campus_db
+      DB_USER: campus_user
+      DB_PASSWORD: campus_secure_pass_2026
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - smartcampus-net
+
+  frontend:
+    build: ./frontend
+    container_name: campus_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend-1
+      - backend-2
+    networks:
+      - smartcampus-net
+
+  nginx:
+    build: ./nginx
+    container_name: campus_nginx_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend-1
+      - backend-2
+      - frontend
+    networks:
+      - smartcampus-net
+
+networks:
+  smartcampus-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local

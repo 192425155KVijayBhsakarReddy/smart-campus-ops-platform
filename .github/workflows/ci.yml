@@ -2,9 +2,9 @@ name: Campus Platform CI/CD Delivery Pipeline
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, 'defect/**', 'feature/**' ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, 'defect/**', 'feature/**' ]
 
 jobs:
   lint-and-validate:

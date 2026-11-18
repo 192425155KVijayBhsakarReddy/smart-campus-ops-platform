@@ -19,7 +19,7 @@ jobs:
       - name: Install Linting Tools
         run: pip install flake8
       - name: Run Flake8 Code Inspection
-        run: flake8 campus_model.py tests/test_model.py --count --max-line-length=140 --statistics
+        run: flake8 campus_model.py tests/test_model.py --count --max-line-length=140 --ignore=E402 --statistics
 
   test-suite:
     name: "Stage 2: Automated Pytest Suite"

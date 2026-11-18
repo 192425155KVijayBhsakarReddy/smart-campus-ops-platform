@@ -1,1 +1,1 @@
-{"campus_name": "SIMATS University", "max_booking_hours": 3, "conflict_strategy": "POSTGRES_GIST_EXCLUSION"}
+{"campus_name": "SIMATS University", "max_booking_hours": 3, "conflict_strategy": "POSTGRES_GIST_EXCLUSION", "resolution": "Resolved via architectural defense"}

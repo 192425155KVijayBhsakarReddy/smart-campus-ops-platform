@@ -1,0 +1,1 @@
+{"campus_name": "SIMATS", "max_booking_hours": 3, "conflict_strategy": "POSTGRES_GIST"} 

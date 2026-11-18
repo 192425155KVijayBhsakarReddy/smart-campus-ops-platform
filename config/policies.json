@@ -1,1 +1,1 @@
-{"campus_name": "SIMATS", "max_booking_hours": 3, "conflict_strategy": "POSTGRES_GIST"} 
+{"campus_name": "SIMATS", "max_booking_hours": 4, "conflict_strategy": "APPLICATION_LEVEL_REDIS"} 

@@ -110,7 +110,7 @@ def test_LP3_live_optimistic_locking_stale_version_409():
 
 
 def test_LP4_live_rbac_student_approval_denial_403():
-    """Verify student identity attempting approval receives HTTP 403, body spoofing is ignored, and booking remains Pending"""
+    """Verify cryptographic RBAC: unverified forged headers rejected, student role denied approval, body spoofing ignored, booking stays Pending"""
     # 1. Fetch available rooms
     _, rooms = _http_request("/rooms/")
     room_code = rooms[0]["room_code"]
@@ -125,21 +125,27 @@ def test_LP4_live_rbac_student_approval_denial_403():
     }
     _, created_booking = _http_request("/bookings/", method="POST", data=booking_slot)
     booking_id = created_booking.get("id")
+    target_id = booking_id if booking_id else "00000000-0000-0000-0000-000000000001"
 
-    # 3. Student attempts approval while spoofing body with user_role: FACILITY_MANAGER
-    # Server derives role strictly from X-User-Role header, ignoring client body spoofing
+    # 3. Forged Header Test: Direct unsigned X-User-Role: ADMIN header rejected with ERR_FORGED_ROLE_HEADER
+    forged_headers = {"X-User-Role": "ADMIN"}
+    status_forged, body_forged = _http_request(f"/bookings/{target_id}/approve/", method="POST", data={"approver_name": "attacker"}, custom_headers=forged_headers)
+    assert status_forged == 403
+    assert body_forged.get("error") == "ERR_FORGED_ROLE_HEADER"
+
+    # 4. Student attempts approval while spoofing body with user_role: FACILITY_MANAGER
+    # Server derives role strictly from trusted identity context, ignoring client body spoofing
     spoofed_payload = {
         "user_role": "FACILITY_MANAGER",  # Spoof attempt in body!
         "approver_name": "student_attacker_192425155"
     }
     student_headers = {"X-User-Role": "STUDENT"}
-    target_id = booking_id if booking_id else "00000000-0000-0000-0000-000000000001"
     status_code, body = _http_request(f"/bookings/{target_id}/approve/", method="POST", data=spoofed_payload, custom_headers=student_headers)
     assert status_code == 403
     assert body.get("error") == "ERR_UNAUTHORIZED_APPROVAL"
     assert "FACILITY_MANAGER" in body.get("authorized_roles", [])
 
-    # 4. State Invariance Verification:
+    # 5. State Invariance Verification:
     # Query database to confirm booking status remained strictly 'PENDING'
     status_get, fetched_booking = _http_request(f"/bookings/{target_id}/")
     assert status_get == 200

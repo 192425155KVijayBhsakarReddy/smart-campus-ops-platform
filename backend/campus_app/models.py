@@ -7,12 +7,13 @@ import uuid
 class Room(models.Model):
     room_code = models.CharField(max_length=32, unique=True, primary_key=True)
     name = models.CharField(max_length=128)
+    campus_id = models.CharField(max_length=32, default='CAMPUS-ENG', db_index=True)
     capacity = models.PositiveIntegerField(default=30)
     is_restricted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.room_code} - {self.name}"
+        return f"{self.room_code} - {self.name} ({self.campus_id})"
 
 class Booking(models.Model):
     STATUS_CHOICES = [
@@ -24,6 +25,7 @@ class Booking(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     booking_reference = models.CharField(max_length=32, unique=True)
+    campus_id = models.CharField(max_length=32, default='CAMPUS-ENG', db_index=True)
     room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name='bookings')
     booked_by = models.CharField(max_length=64)
     user_role = models.CharField(max_length=32, default='FACULTY')
@@ -112,3 +114,26 @@ class AuditEvent(models.Model):
 
     def __str__(self):
         return f"[{self.timestamp}] {self.entity_type} {self.entity_id}: {self.action} ({self.from_state}->{self.to_state}) by {self.actor}"
+
+class OutboxIntent(models.Model):
+    STATUS_CHOICES = [
+        ('PENDING_RETRY', 'Pending Retry'),
+        ('PROCESSED', 'Processed'),
+        ('DEAD_LETTER', 'Dead Letter'),
+    ]
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    intent_id = models.CharField(max_length=64, unique=True, db_index=True)
+    event_type = models.CharField(max_length=64)
+    payload = models.JSONField()
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default='PENDING_RETRY', db_index=True)
+    retry_count = models.PositiveIntegerField(default=0)
+    next_retry_at = models.FloatField(default=0.0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.intent_id} ({self.status})"
+

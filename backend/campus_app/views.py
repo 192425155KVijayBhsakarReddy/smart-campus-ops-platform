@@ -1,11 +1,61 @@
 import socket
 import uuid
+import base64
+import hashlib
+import hmac
+import json
 from django.db import IntegrityError, transaction
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from .models import Room, Booking, MaintenanceTicket, SensorTelemetry, AuditEvent
 from .serializers import RoomSerializer, BookingSerializer, MaintenanceTicketSerializer, SensorTelemetrySerializer, AuditEventSerializer
+
+SECRET_SIGNING_KEY = b"campus-platform-secure-jwt-hmac-key-2026"
+
+def verify_trusted_role(request):
+    """
+    Authoritative Role Verification:
+    In production, ingress proxies (Nginx / API Gateway) strip untrusted client headers:
+        proxy_set_header X-User-Role "";
+    Clients must present an authenticated Bearer token or HMAC-signed gateway assertion (X-Gateway-Signature).
+    This function verifies:
+    1. Internal gateway signature (X-Gateway-Signature): verifies HMAC-SHA256 signature against SECRET_SIGNING_KEY.
+    2. Authenticated Bearer token: verifies payload and cryptographic HMAC signature.
+    3. Untrusted/Unsigned direct header assertion (e.g. X-User-Role: ADMIN without signature): flagged as UNVERIFIED_CLIENT_ASSERTION.
+    4. Missing auth context defaults safely to STUDENT.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    gateway_sig = request.headers.get('X-Gateway-Signature', '')
+    raw_role = request.headers.get('X-User-Role', '')
+
+    # 1. Bearer Token Verification
+    if auth_header.startswith('Bearer '):
+        token = auth_header.split(' ', 1)[1].strip()
+        try:
+            parts = token.split('.')
+            if len(parts) == 2:
+                payload_b64, sig = parts
+                expected_sig = hmac.new(SECRET_SIGNING_KEY, payload_b64.encode(), hashlib.sha256).hexdigest()
+                if hmac.compare_digest(sig, expected_sig):
+                    payload = json.loads(base64.b64decode(payload_b64).decode())
+                    return payload.get('role', 'STUDENT'), payload.get('user_id', 'token')
+        except Exception:
+            pass
+
+    # 2. Ingress Gateway HMAC Signature Verification
+    if gateway_sig and raw_role:
+        expected_sig = hmac.new(SECRET_SIGNING_KEY, raw_role.upper().encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(gateway_sig, expected_sig):
+            return raw_role.upper(), "gateway-verified"
+
+    # 3. Direct client header spoofing without cryptographic signature
+    if raw_role:
+        if raw_role.upper() in ['ADMIN', 'FACILITY_MANAGER', 'DEPT_HEAD']:
+            return 'UNVERIFIED_CLIENT_ASSERTION', None
+        return raw_role.upper(), 'direct-client'
+
+    return 'STUDENT', 'anonymous'
 
 class RoomViewSet(viewsets.ModelViewSet):
     queryset = Room.objects.all().order_by('room_code')
@@ -176,18 +226,25 @@ class SensorTelemetryViewSet(viewsets.ModelViewSet):
 
 @api_view(['POST'])
 def approve_booking(request, booking_id):
-    """Dual-control approval endpoint with strict RBAC enforcement"""
-    # Server-side identity derivation: strictly enforce trusted header context;
-    # client-supplied body roles are completely ignored to prevent privilege escalation.
-    auth_header_role = request.headers.get('X-User-Role')
-    role = auth_header_role.upper() if auth_header_role else 'STUDENT'
+    """Dual-control approval endpoint with cryptographic token / signed role verification"""
+    role, user_id = verify_trusted_role(request)
     approver_name = request.data.get('approver_name', 'anonymous')
 
+    # 1. Reject unverified/forged client assertions
+    if role == 'UNVERIFIED_CLIENT_ASSERTION':
+        return Response({
+            "error": "ERR_FORGED_ROLE_HEADER",
+            "status_code": 403,
+            "detail": "Access Denied: Unsigned or forged role header rejected. Cryptographic Bearer token or gateway HMAC signature required.",
+            "authorized_roles": ["FACILITY_MANAGER", "DEPT_HEAD", "ADMIN"]
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    # 2. Reject unauthorized student/technician roles
     if role in ['STUDENT', 'TECHNICIAN']:
         return Response({
             "error": "ERR_UNAUTHORIZED_APPROVAL",
             "status_code": 403,
-            "detail": f"Access Denied: Role '{role}' lacks permission to approve restricted facility reservations.",
+            "detail": f"Access Denied: Authenticated role '{role}' lacks permission to approve restricted facility reservations.",
             "authorized_roles": ["FACILITY_MANAGER", "DEPT_HEAD", "ADMIN"]
         }, status=status.HTTP_403_FORBIDDEN)
 

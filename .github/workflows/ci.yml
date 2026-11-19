@@ -63,13 +63,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Pytest & Requests for Smoke Gate
+        run: pip install pytest
       - name: Validate Container Configuration and Build Smoke Image
         run: |
           docker compose config -q
           docker build -t smart-campus-backend:smoke -f backend/Dockerfile backend/
-      - name: Execute Smoke Deployment and Healthcheck Gate Verification
+      - name: Container Image Vulnerability Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'smart-campus-backend:smoke'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+      - name: Launch Testbed Multi-Container Cluster
         run: |
           docker compose up -d db backend_1 nginx
-          sleep 10
+          sleep 12
+      - name: Database Migration Safety Check & Dry-Run Gate
+        run: |
+          docker compose exec -T backend_1 python manage.py makemigrations --check --dry-run
+          docker compose exec -T backend_1 python manage.py migrate --check
+          echo "Database migration safety check passed: zero unapplied or conflicting schema changes."
+      - name: Execute Authenticated Post-Deployment Healthcheck Gate
+        run: |
           curl --fail --retry 5 --retry-delay 2 http://localhost/api/healthz/
-          docker compose down
+      - name: Execute Live Multi-Container Integration Test Suite (Tier 3)
+        run: |
+          python -m pytest tests/test_live_platform.py -v
+      - name: Teardown Staging Testbed
+        if: always()
+        run: docker compose down

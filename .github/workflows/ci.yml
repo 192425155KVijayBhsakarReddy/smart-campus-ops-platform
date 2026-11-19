@@ -55,7 +55,7 @@ jobs:
       - name: Dependency Security Audit
         run: |
           pip install pip-audit
-          pip-audit --desc on || echo "Audit complete - no critical vulnerabilities blocking release."
+          pip-audit --desc on
 
   deploy-testbed:
     name: "Stage 4: Testbed Smoke Deployment"
@@ -63,12 +63,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Container Configuration
+      - name: Validate Container Configuration and Build Smoke Image
         run: |
           docker compose config -q
-          echo "Docker compose configuration validated successfully."
-      - name: Execute Authenticated Post-Deployment Healthcheck
+          docker build -t smart-campus-backend:smoke -f backend/Dockerfile backend/
+      - name: Execute Smoke Deployment and Healthcheck Gate Verification
         run: |
-          echo "Simulating container healthcheck gate verification..."
-          echo "GET /api/healthz/ -> HTTP 200 OK: {status: healthy, db: connected}"
-          echo "Release Quality Gates: PASS - Ready for production cutover."
+          docker compose up -d db backend_1 nginx
+          sleep 10
+          curl --fail --retry 5 --retry-delay 2 http://localhost/api/healthz/
+          docker compose down

@@ -13,9 +13,11 @@ import time
 
 BASE_URL = "http://localhost/api"
 
-def _http_request(endpoint, method="GET", data=None):
+def _http_request(endpoint, method="GET", data=None, custom_headers=None):
     url = f"{BASE_URL}/{endpoint.lstrip('/')}"
     headers = {"Content-Type": "application/json", "User-Agent": "PytestLiveRunner/1.0"}
+    if custom_headers:
+        headers.update(custom_headers)
     encoded_data = json.dumps(data).encode("utf-8") if data else None
     req = urllib.request.Request(url, data=encoded_data, headers=headers, method=method)
     try:
@@ -44,17 +46,15 @@ def test_LP2_live_gist_exclusion_overlap_409():
     assert len(rooms) > 0
     room_code = rooms[0]["room_code"]
 
-    # 2. Book a specific timeslot (e.g. 14:00 to 16:00 UTC)
-    t_base = int(time.time()) + 72000
+    # 2. Book a specific timeslot (10:00 to 12:00 UTC)
     slot_a = {
         "room": room_code,
         "booked_by": "Prof. Davis",
         "purpose": "Autonomous Robotics Lab Session",
-        "start_time": f"2026-11-20T10:00:00Z",
-        "end_time": f"2026-11-20T12:00:00Z"
+        "start_time": "2026-11-20T10:00:00Z",
+        "end_time": "2026-11-20T12:00:00Z"
     }
     status_a, res_a = _http_request("/bookings/", method="POST", data=slot_a)
-    # Either successfully created (201) or already booked (409)
     assert status_a in [201, 409]
 
     # 3. Attempt overlapping booking (11:00 to 13:00 UTC)
@@ -62,8 +62,8 @@ def test_LP2_live_gist_exclusion_overlap_409():
         "room": room_code,
         "booked_by": "Student Club",
         "purpose": "Drone Flight Practice",
-        "start_time": f"2026-11-20T11:00:00Z",
-        "end_time": f"2026-11-20T13:00:00Z"
+        "start_time": "2026-11-20T11:00:00Z",
+        "end_time": "2026-11-20T13:00:00Z"
     }
     status_b, res_b = _http_request("/bookings/", method="POST", data=slot_overlap)
     assert status_b == 409
@@ -74,6 +74,7 @@ def test_LP3_live_optimistic_locking_stale_version_409():
     """Verify ticket transition with stale expected_version is rejected with HTTP 409 Conflict"""
     # 1. Create a ticket
     ticket_payload = {
+        "ticket_number": f"TKT-{uuid.uuid4().hex[:6].upper()}",
         "title": "HVAC Chiller Valve Stuck",
         "category": "FACILITIES",
         "impact": "HIGH",
@@ -109,21 +110,44 @@ def test_LP3_live_optimistic_locking_stale_version_409():
 
 
 def test_LP4_live_rbac_student_approval_denial_403():
-    """Verify student role attempting approval receives HTTP 403 Forbidden with ERR_UNAUTHORIZED_APPROVAL"""
-    # Use any valid UUID
-    test_uuid = "00000000-0000-0000-0000-000000000001"
-    approval_payload = {
-        "user_role": "STUDENT",
+    """Verify student identity attempting approval receives HTTP 403, body spoofing is ignored, and booking remains Pending"""
+    # 1. Fetch available rooms
+    _, rooms = _http_request("/rooms/")
+    room_code = rooms[0]["room_code"]
+
+    # 2. Create a fresh booking
+    booking_slot = {
+        "room": room_code,
+        "booked_by": "Researcher Sarah",
+        "purpose": "Restricted Quantum Optics Session",
+        "start_time": f"2026-11-28T{int(time.time())%24:02d}:00:00Z",
+        "end_time": f"2026-11-28T{(int(time.time())%24)+1:02d}:00:00Z"
+    }
+    _, created_booking = _http_request("/bookings/", method="POST", data=booking_slot)
+    booking_id = created_booking.get("id")
+
+    # 3. Student attempts approval while spoofing body with user_role: FACILITY_MANAGER
+    # Server derives role strictly from X-User-Role header, ignoring client body spoofing
+    spoofed_payload = {
+        "user_role": "FACILITY_MANAGER",  # Spoof attempt in body!
         "approver_name": "student_attacker_192425155"
     }
-    status_code, body = _http_request(f"/bookings/{test_uuid}/approve/", method="POST", data=approval_payload)
+    student_headers = {"X-User-Role": "STUDENT"}
+    target_id = booking_id if booking_id else "00000000-0000-0000-0000-000000000001"
+    status_code, body = _http_request(f"/bookings/{target_id}/approve/", method="POST", data=spoofed_payload, custom_headers=student_headers)
     assert status_code == 403
     assert body.get("error") == "ERR_UNAUTHORIZED_APPROVAL"
     assert "FACILITY_MANAGER" in body.get("authorized_roles", [])
 
+    # 4. State Invariance Verification:
+    # Query database to confirm booking status remained strictly 'PENDING'
+    status_get, fetched_booking = _http_request(f"/bookings/{target_id}/")
+    assert status_get == 200
+    assert fetched_booking.get("status") == "PENDING"
+
 
 def test_LP5_live_idempotent_telemetry_ingestion():
-    """Verify repeated telemetry event ingestion is idempotent"""
+    """Verify repeated telemetry event ingestion is idempotent and creates exactly 1 record"""
     event_id = f"evt-test-{uuid.uuid4().hex[:6]}"
     telemetry_payload = {
         "sensor_id": "SNSR-TEMP-LAB204",
@@ -132,6 +156,12 @@ def test_LP5_live_idempotent_telemetry_ingestion():
         "humidity": 45.0
     }
     status1, _ = _http_request("/telemetry/", method="POST", data=telemetry_payload)
-    status2, _ = _http_request("/telemetry/", method="POST", data=telemetry_payload)
+    status2, res2 = _http_request("/telemetry/", method="POST", data=telemetry_payload)
     assert status1 in [200, 201]
-    assert status2 in [200, 201]
+    assert status2 == 200
+    assert res2.get("duplicate_ignored") is True
+
+    # Verify exactly 1 persistent record exists with this event_id
+    _, all_telemetry = _http_request("/telemetry/")
+    matching = [t for t in all_telemetry if t.get("event_id") == event_id]
+    assert len(matching) == 1

@@ -177,7 +177,10 @@ class SensorTelemetryViewSet(viewsets.ModelViewSet):
 @api_view(['POST'])
 def approve_booking(request, booking_id):
     """Dual-control approval endpoint with strict RBAC enforcement"""
-    role = request.data.get('user_role', 'STUDENT')
+    # Server-side identity derivation: strictly enforce trusted header context;
+    # client-supplied body roles are completely ignored to prevent privilege escalation.
+    auth_header_role = request.headers.get('X-User-Role')
+    role = auth_header_role.upper() if auth_header_role else 'STUDENT'
     approver_name = request.data.get('approver_name', 'anonymous')
 
     if role in ['STUDENT', 'TECHNICIAN']:

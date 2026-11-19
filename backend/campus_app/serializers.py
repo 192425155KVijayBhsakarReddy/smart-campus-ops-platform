@@ -34,7 +34,7 @@ class MaintenanceTicketSerializer(serializers.ModelSerializer):
     class Meta:
         model = MaintenanceTicket
         fields = '__all__'
-        read_only_fields = ['id', 'ticket_number', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
 
 class SensorTelemetrySerializer(serializers.ModelSerializer):
     class Meta:

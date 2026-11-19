@@ -177,10 +177,9 @@ class Store:
 
 
 try:
-    from backend.campus_app.policies import MultiCampusPolicyEngine, OutboxIntentBuffer
+    from backend.campus_app.policies import MultiCampusPolicyEngine, OutboxIntentBuffer  # noqa: F401
 except ImportError:
     import sys
     import os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
-    from campus_app.policies import MultiCampusPolicyEngine, OutboxIntentBuffer
-
+    from campus_app.policies import MultiCampusPolicyEngine, OutboxIntentBuffer  # noqa: F401

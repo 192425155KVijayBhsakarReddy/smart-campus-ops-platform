@@ -33,38 +33,51 @@ def test_D4_3_datacenter_temp_threshold_24():
     assert MultiCampusPolicyEngine.check_temp_breach("CAMPUS-DC", 24.01) is True
 
 
-def test_D4_4_calendar_outage_durable_intent_buffering_and_retry_worker():
+def test_D4_4_outbox_survives_application_restart_and_drains_queue():
     """
-    Verify durable disk-backed outbox intent storage during HTTP 503 outage,
-    followed by automated retry worker queue drainage upon remote recovery.
+    Verify durable disk-backed outbox intent storage survives complete application restart:
+    1. Intent is dispatched during HTTP 503 outage and persisted to disk file.
+    2. In-memory buffer instance is terminated/deleted.
+    3. Fresh buffer instance re-opens datastore and recovers pending intent.
+    4. Persistent retry worker drains queue upon simulated service recovery.
     """
-    outbox = OutboxIntentBuffer(":memory:")
-    
-    # 1. External Calendar API experiences HTTP 503 outage -> intent is persisted to ACID storage
-    res = outbox.dispatch(
-        "CALENDAR_SYNC",
-        {"booking_id": "BK-2026-901", "campus_id": "CAMPUS-MED"},
-        remote_status_code=503
-    )
-    assert res["status"] == "BUFFERED"
-    assert outbox.count_intents("PENDING_RETRY") == 1
+    test_db = os.path.join(os.path.dirname(__file__), "test_restart_outbox.db")
+    if os.path.exists(test_db):
+        os.remove(test_db)
 
-    # 2. Simulated failure retry: Remote endpoint still down -> increments retry_count
-    def failing_handler(evt, payload):
-        return False
-    
-    retry_res1 = outbox.process_outbox_queue(failing_handler, max_retries=3)
-    assert retry_res1["retried"] == 1
-    assert retry_res1["remaining_pending"] == 1
+    try:
+        # Phase 1: Application running, experiences remote 503 outage
+        outbox1 = OutboxIntentBuffer(test_db)
+        res1 = outbox1.dispatch(
+            "CALENDAR_SYNC",
+            {"booking_id": "BK-2026-MED-99", "campus_id": "CAMPUS-MED", "slot": "10:00-13:50"},
+            remote_status_code=503,
+            intent_id="INTENT-RESTART-001"
+        )
+        assert res1["status"] == "BUFFERED"
+        assert outbox1.count_intents("PENDING_RETRY") == 1
 
-    # 3. Simulated recovery: Remote endpoint returns HTTP 200 -> worker processes queue
-    def recovered_handler(evt, payload):
-        return True
+        # Phase 2: Application crash / restart simulation (destroy outbox1 reference)
+        del outbox1
 
-    retry_res2 = outbox.process_outbox_queue(recovered_handler, max_retries=3)
-    assert retry_res2["processed"] == 1
-    assert retry_res2["remaining_pending"] == 0
-    assert outbox.count_intents("PROCESSED") == 1
+        # Phase 3: Application boots fresh, attaches to same persistent SQLite database
+        outbox2 = OutboxIntentBuffer(test_db)
+        pending = outbox2.get_pending_intents()
+        assert len(pending) == 1
+        assert pending[0]["intent_id"] == "INTENT-RESTART-001"
+        assert pending[0]["status"] == "PENDING_RETRY"
+
+        # Phase 4: Remote service recovered (HTTP 200) -> Worker processes queue
+        def recovered_calendar_api(event_type, payload):
+            return True
+
+        worker_result = outbox2.process_outbox_queue(recovered_calendar_api, max_retries=3)
+        assert worker_result["processed"] == 1
+        assert worker_result["remaining_pending"] == 0
+        assert outbox2.count_intents("PROCESSED") == 1
+    finally:
+        if os.path.exists(test_db):
+            os.remove(test_db)
 
 
 def test_D4_5_schema_expand_and_contract_iso8601_backward_compat():
@@ -103,3 +116,48 @@ def test_D4_5_schema_expand_and_contract_iso8601_backward_compat():
     }
     with pytest.raises(ValueError, match="must be strictly after start_time"):
         MultiCampusPolicyEngine.normalize_and_validate_booking_payload(bad_payload)
+
+
+def test_D4_6_outbox_duplicate_prevention_and_dead_letter():
+    """
+    Verify outbox duplicate prevention via unique intent_id,
+    and automatic transition to DEAD_LETTER after max retry exhaustion.
+    """
+    test_db = os.path.join(os.path.dirname(__file__), "test_dead_letter.db")
+    if os.path.exists(test_db):
+        os.remove(test_db)
+
+    try:
+        outbox = OutboxIntentBuffer(test_db)
+
+        # 1. Duplicate Intent Prevention Check
+        fixed_id = "INTENT-DEDUP-007"
+        res1 = outbox.dispatch("TICKET_SYNC", {"tkt": "TKT-101"}, 503, intent_id=fixed_id)
+        assert res1["status"] == "BUFFERED"
+
+        res2 = outbox.dispatch("TICKET_SYNC", {"tkt": "TKT-101"}, 503, intent_id=fixed_id)
+        assert res2["duplicate_ignored"] is True
+        assert outbox.count_intents() == 1  # Exactly 1 record exists
+
+        # 2. Max Retry Exhaustion -> Dead Letter Transition
+        def persistently_failing_service(event_type, payload):
+            raise ConnectionResetError("Remote server refused connection")
+
+        # Attempt 1 -> retry_count = 1
+        r1 = outbox.process_outbox_queue(persistently_failing_service, max_retries=3)
+        assert r1["retried"] == 1
+        assert outbox.count_intents("PENDING_RETRY") == 1
+
+        # Attempt 2 -> retry_count = 2
+        r2 = outbox.process_outbox_queue(persistently_failing_service, max_retries=3)
+        assert r2["retried"] == 1
+        assert outbox.count_intents("PENDING_RETRY") == 1
+
+        # Attempt 3 -> retry_count = 3 >= max_retries (3) -> DEAD_LETTER
+        r3 = outbox.process_outbox_queue(persistently_failing_service, max_retries=3)
+        assert r3["dead_letter"] == 1
+        assert r3["remaining_pending"] == 0
+        assert outbox.count_intents("DEAD_LETTER") == 1
+    finally:
+        if os.path.exists(test_db):
+            os.remove(test_db)

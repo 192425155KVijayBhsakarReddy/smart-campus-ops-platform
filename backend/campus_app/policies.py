@@ -106,84 +106,118 @@ class MultiCampusPolicyEngine:
 class OutboxIntentBuffer:
     """
     Durable Database-Backed Outbox Buffer:
-    Persists integration intents directly to an ACID-compliant disk store (SQLite / PostgreSQL)
-    ensuring zero data loss across process crashes, container restarts, and network partitions.
+    Persists integration intents directly to an ACID-compliant disk store (SQLite / PostgreSQL),
+    ensuring zero data loss across process crashes, application restarts, and network partitions.
     """
-    def __init__(self, db_path=":memory:"):
+    def __init__(self, db_path="outbox_intents.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
         self._init_db()
 
-    def _init_db(self):
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS outbox_intents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    intent_id TEXT UNIQUE NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    retry_count INTEGER DEFAULT 0,
-                    next_retry_at REAL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    processed_at REAL
-                );
-            """)
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def dispatch(self, event_type: str, payload: dict, remote_status_code: int):
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS outbox_intents (
+                        intent_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        retry_count INTEGER DEFAULT 0,
+                        next_retry_at REAL DEFAULT 0.0,
+                        last_error TEXT,
+                        created_at REAL NOT NULL,
+                        processed_at REAL
+                    );
+                """)
+        finally:
+            conn.close()
+
+    def dispatch(self, event_type: str, payload: dict, remote_status_code: int, intent_id: str = None):
         """
         Dispatches external synchronization intent.
-        On remote failure (HTTP 502/503/504), writes durable intent to outbox table with status PENDING_RETRY.
+        Prevents duplicate processing using unique intent_id.
+        On remote failure (HTTP 500/502/503/504), writes durable intent to ACID storage with status PENDING_RETRY.
         """
-        intent_id = f"INTENT-{uuid.uuid4().hex[:8].upper()}"
+        if not intent_id:
+            intent_id = f"INTENT-{uuid.uuid4().hex[:8].upper()}"
         now = time.time()
-        
-        if remote_status_code == 200:
-            with self.conn:
-                self.conn.execute("""
-                    INSERT INTO outbox_intents (intent_id, event_type, payload, status, retry_count, created_at, processed_at)
-                    VALUES (?, ?, ?, 'PROCESSED', 0, ?, ?);
-                """, (intent_id, event_type, json.dumps(payload), now, now))
-            return {"status": "SYNCED", "remote_id": "EXT-9901", "intent_id": intent_id}
-        elif remote_status_code in [502, 503, 504]:
-            with self.conn:
-                self.conn.execute("""
-                    INSERT INTO outbox_intents (intent_id, event_type, payload, status, retry_count, next_retry_at, created_at)
-                    VALUES (?, ?, ?, 'PENDING_RETRY', 0, ?, ?);
-                """, (intent_id, event_type, json.dumps(payload), now, now))
-            return {
-                "status": "BUFFERED",
-                "intent_id": intent_id,
-                "intent": {
-                    "event_type": event_type,
-                    "payload": payload,
-                    "status": "PENDING_RETRY",
-                    "retries": 0
-                }
-            }
-        else:
-            raise RuntimeError(f"Unexpected remote gateway error: HTTP {remote_status_code}")
+        payload_json = json.dumps(payload)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                cur = conn.cursor()
+                cur.execute("SELECT intent_id, status FROM outbox_intents WHERE intent_id = ?;", (intent_id,))
+                existing = cur.fetchone()
+                if existing:
+                    return {
+                        "status": existing["status"],
+                        "intent_id": intent_id,
+                        "duplicate_ignored": True
+                    }
+
+                if remote_status_code == 200:
+                    conn.execute("""
+                        INSERT INTO outbox_intents (intent_id, event_type, payload, status, retry_count, created_at, processed_at)
+                        VALUES (?, ?, ?, 'PROCESSED', 0, ?, ?);
+                    """, (intent_id, event_type, payload_json, now, now))
+                    return {"status": "SYNCED", "remote_id": "EXT-9901", "intent_id": intent_id}
+                elif remote_status_code in [500, 502, 503, 504]:
+                    conn.execute("""
+                        INSERT INTO outbox_intents (intent_id, event_type, payload, status, retry_count, next_retry_at, created_at)
+                        VALUES (?, ?, ?, 'PENDING_RETRY', 0, ?, ?);
+                    """, (intent_id, event_type, payload_json, now, now))
+                    return {
+                        "status": "BUFFERED",
+                        "intent_id": intent_id,
+                        "intent": {
+                            "event_type": event_type,
+                            "payload": payload,
+                            "status": "PENDING_RETRY",
+                            "retries": 0
+                        }
+                    }
+                else:
+                    raise RuntimeError(f"Unexpected remote gateway error: HTTP {remote_status_code}")
+        finally:
+            conn.close()
 
     def get_pending_intents(self):
         """Fetches all un-dispatched intents from durable storage."""
-        self.conn.row_factory = sqlite3.Row
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM outbox_intents WHERE status = 'PENDING_RETRY' ORDER BY id ASC;")
-        return [dict(row) for row in cursor.fetchall()]
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM outbox_intents WHERE status = 'PENDING_RETRY' ORDER BY created_at ASC;")
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
 
     def count_intents(self, status=None):
-        cursor = self.conn.cursor()
-        if status:
-            cursor.execute("SELECT COUNT(*) FROM outbox_intents WHERE status = ?;", (status,))
-        else:
-            cursor.execute("SELECT COUNT(*) FROM outbox_intents;")
-        return cursor.fetchone()[0]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.cursor()
+            if status:
+                cur.execute("SELECT COUNT(*) FROM outbox_intents WHERE status = ?;", (status,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM outbox_intents;")
+            return cur.fetchone()[0]
+        finally:
+            conn.close()
 
-    def process_outbox_queue(self, mock_remote_handler, max_retries=3, backoff_base=2):
+    def process_outbox_queue(self, remote_handler, max_retries=3, backoff_base=2.0):
         """
-        Persistent background worker loop:
+        Persistent background retry worker:
         Scans durable outbox table for PENDING_RETRY records, attempts synchronization,
-        applies exponential backoff with jitter on failures, and marks completed or dead-lettered records.
+        applies exponential backoff with jitter on failures, and transitions records to DEAD_LETTER when exhausted.
         """
         processed_count = 0
         retried_count = 0
@@ -191,31 +225,39 @@ class OutboxIntentBuffer:
         now = time.time()
 
         pending = self.get_pending_intents()
-        with self.conn:
-            for item in pending:
-                iid = item["intent_id"]
-                retries = item["retry_count"]
-                payload = json.loads(item["payload"])
-                event_type = item["event_type"]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                for item in pending:
+                    iid = item["intent_id"]
+                    retries = item["retry_count"]
+                    payload = json.loads(item["payload"])
+                    event_type = item["event_type"]
 
-                success = False
-                try:
-                    success = mock_remote_handler(event_type, payload)
-                except Exception:
                     success = False
+                    err_msg = ""
+                    try:
+                        success = remote_handler(event_type, payload)
+                    except Exception as ex:
+                        success = False
+                        err_msg = str(ex)
 
-                if success:
-                    self.conn.execute("UPDATE outbox_intents SET status = 'PROCESSED', processed_at = ? WHERE intent_id = ?;", (now, iid))
-                    processed_count += 1
-                else:
-                    new_retries = retries + 1
-                    if new_retries >= max_retries:
-                        self.conn.execute("UPDATE outbox_intents SET status = 'DEAD_LETTER', retry_count = ? WHERE intent_id = ?;", (new_retries, iid))
-                        dead_letter_count += 1
+                    if success:
+                        conn.execute("UPDATE outbox_intents SET status = 'PROCESSED', processed_at = ? WHERE intent_id = ?;", (now, iid))
+                        processed_count += 1
                     else:
-                        backoff = (backoff_base ** new_retries)
-                        self.conn.execute("UPDATE outbox_intents SET retry_count = ?, next_retry_at = ? WHERE intent_id = ?;", (new_retries, now + backoff, iid))
-                        retried_count += 1
+                        new_retries = retries + 1
+                        if new_retries >= max_retries:
+                            conn.execute("UPDATE outbox_intents SET status = 'DEAD_LETTER', retry_count = ?, last_error = ? WHERE intent_id = ?;", 
+                                         (new_retries, err_msg or "Max retries exceeded", iid))
+                            dead_letter_count += 1
+                        else:
+                            backoff = (backoff_base ** new_retries)
+                            conn.execute("UPDATE outbox_intents SET retry_count = ?, next_retry_at = ?, last_error = ? WHERE intent_id = ?;", 
+                                         (new_retries, now + backoff, err_msg or "Remote unavailable", iid))
+                            retried_count += 1
+        finally:
+            conn.close()
 
         return {
             "processed": processed_count,

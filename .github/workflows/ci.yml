@@ -19,7 +19,7 @@ jobs:
       - name: Install Linting Tools
         run: pip install flake8
       - name: Run Flake8 Code Inspection
-        run: flake8 campus_model.py tests/test_model.py --count --max-line-length=140 --ignore=E402 --statistics
+        run: flake8 campus_model.py tests/test_model.py tests/test_day4_adaptation.py tests/test_migrations.py --count --max-line-length=140 --ignore=E402 --statistics
 
   test-suite:
     name: "Stage 2: Automated Pytest Suite"
@@ -31,10 +31,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install Pytest
-        run: pip install pytest
-      - name: Run Authoritative Pytest Suite (Domain & Adaptation Checks)
-        run: python -m pytest tests/test_model.py tests/test_day4_adaptation.py -v --junitxml=test-results.xml
+      - name: Install Pytest & Test Suite Dependencies
+        run: pip install pytest django djangorestframework pytest-cov
+      - name: Run Authoritative Pytest Suite (Domain, Adaptation & Migration Checks)
+        run: python -m pytest tests/test_model.py tests/test_day4_adaptation.py tests/test_migrations.py -v --cov=campus_model --cov=backend.campus_app.policies --cov-report=term-missing --junitxml=test-results.xml
       - name: Upload Test Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -52,10 +52,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Dependency Security Audit
+      - name: Dependency Security Audit (pip-audit)
         run: |
           pip install pip-audit
-          pip-audit --desc on
+          pip-audit --desc on -f json -o pip-audit-report.json || pip-audit --desc on
+      - name: Upload Dependency Audit Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
 
   deploy-testbed:
     name: "Stage 4: Testbed Smoke Deployment"
@@ -68,18 +74,25 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install Pytest & Requests for Smoke Gate
-        run: pip install pytest
+        run: pip install pytest requests
       - name: Validate Container Configuration and Build Smoke Image
         run: |
           docker compose config -q
           docker build -t smart-campus-backend:smoke -f backend/Dockerfile backend/
-      - name: Container Image Vulnerability Scan (Trivy)
+      - name: Container Image Vulnerability Scan (Trivy Security Gate)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'smart-campus-backend:smoke'
           format: 'table'
-          exit-code: '0'
+          output: 'trivy-report.txt'
+          exit-code: '1'
           severity: 'CRITICAL,HIGH'
+      - name: Upload Trivy Scan Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report
+          path: trivy-report.txt
       - name: Launch Testbed Multi-Container Cluster
         run: |
           docker compose up -d db backend_1 nginx

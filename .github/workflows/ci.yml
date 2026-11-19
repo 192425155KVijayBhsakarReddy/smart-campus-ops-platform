@@ -33,8 +33,8 @@ jobs:
           python-version: "3.11"
       - name: Install Pytest
         run: pip install pytest
-      - name: Run Authoritative Pytest Suite (14 Checks)
-        run: python -m pytest tests/test_model.py -v --junitxml=test-results.xml
+      - name: Run Authoritative Pytest Suite (Domain & Adaptation Checks)
+        run: python -m pytest tests/test_model.py tests/test_day4_adaptation.py -v --junitxml=test-results.xml
       - name: Upload Test Report Artifact
         if: always()
         uses: actions/upload-artifact@v4

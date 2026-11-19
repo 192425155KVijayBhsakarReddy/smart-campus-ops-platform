@@ -60,7 +60,7 @@ class MaintenanceTicketViewSet(viewsets.ModelViewSet):
             data['ticket_number'] = f"TKT-{uuid.uuid4().hex[:6].upper()}"
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
-        ticket = serializer.save()
+        ticket = serializer.save(ticket_number=data['ticket_number'])
         AuditEvent.objects.create(
             entity_type='TICKET',
             entity_id=ticket.ticket_number,

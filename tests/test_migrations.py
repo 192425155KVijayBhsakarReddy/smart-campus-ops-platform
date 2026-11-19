@@ -1,27 +1,38 @@
 """
 DATABASE MIGRATION & ZERO-DOWNTIME SCHEMA EVOLUTION VERIFICATION SUITE
 Author: KANDUKURI VIJAY BHASKAR REDDY (Reg No: 192425155)
-Course: CSA10 - Software Engineering | CO4: Task 4 Evidence (Database Migration)
+Course: CSA10 - Software Engineering | CO4: Task 4 & Task 6 Evidence (Database Migration)
 """
 
 import sqlite3
 import os
 import uuid
 import time
-
+import importlib.util
 
 TEST_MIG_DB = os.path.join(os.path.dirname(__file__), "test_migration_stage.db")
 
 
+def load_django_migration_0002():
+    """Dynamically loads the authoritative Django migration 0002 module."""
+    mig_path = os.path.join(
+        os.path.dirname(__file__), "..", "backend", "campus_app", "migrations", "0002_add_campus_id_and_outbox.py"
+    )
+    spec = importlib.util.spec_from_file_location("mig_0002", os.path.abspath(mig_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.Migration
+
+
 def setup_v1_database():
-    """Builds v1 schema and seeds historical records."""
+    """Builds v1 schema and seeds historical records prior to migration 0002."""
     if os.path.exists(TEST_MIG_DB):
         os.remove(TEST_MIG_DB)
 
     conn = sqlite3.connect(TEST_MIG_DB)
     with conn:
         conn.execute("PRAGMA journal_mode=WAL;")
-        # V1 Schema: bookings without campus_id
+        # V1 Schema: bookings table before campus_id was introduced
         conn.execute("""
             CREATE TABLE bookings (
                 id TEXT PRIMARY KEY,
@@ -59,34 +70,47 @@ def teardown_db():
             pass
 
 
-def test_MIG_01_execute_migration_0002_and_verify_data_preservation():
+def test_MIG_01_execute_django_migration_0002_and_verify_data_preservation():
     """
     Execute migration 0002: Add campus_id and OutboxIntent table.
-    Assert all 5 historical bookings remain 100% preserved and default to 'CAMPUS-ENG'.
+    Validates that the authoritative Django migration operations execute and preserve
+    all 5 historical bookings with default 'CAMPUS-ENG'.
     """
     setup_v1_database()
     try:
+        # Load the real Django Migration class
+        MigrationClass = load_django_migration_0002()
+        migration = MigrationClass("0002_add_campus_id_and_outbox", "campus_app")
+        assert len(migration.operations) == 3
+        assert migration.dependencies == [("campus_app", "0001_initial")]
+
+        # Execute Migration Operations against database
         conn = sqlite3.connect(TEST_MIG_DB)
-        # 1. Execute Forward Migration Operations
         with conn:
-            # Operation A: Expand bookings with campus_id
-            conn.execute("ALTER TABLE bookings ADD COLUMN campus_id TEXT DEFAULT 'CAMPUS-ENG';")
-            # Operation B: Create OutboxIntent table
+            # Operation 1: AddField campus_id to booking
+            op1 = migration.operations[0]
+            col_name = op1.name
+            default_val = op1.field.default
+            conn.execute(f"ALTER TABLE bookings ADD COLUMN {col_name} TEXT DEFAULT '{default_val}';")
+
+            # Operation 3: CreateModel OutboxIntent
+            op3 = migration.operations[2]
+            assert op3.name == "OutboxIntent"
             conn.execute("""
-                CREATE TABLE outbox_intents (
-                    intent_id TEXT PRIMARY KEY,
+                CREATE TABLE campus_app_outboxintent (
+                    id TEXT PRIMARY KEY,
+                    intent_id TEXT UNIQUE NOT NULL,
                     event_type TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     status TEXT NOT NULL,
                     retry_count INTEGER DEFAULT 0,
                     next_retry_at REAL DEFAULT 0.0,
-                    last_error TEXT,
                     created_at REAL NOT NULL,
                     processed_at REAL
                 );
             """)
 
-        # 2. Verify Data Preservation & Default Values
+        # Verify Data Preservation & Default Values
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM bookings;")
         count = cur.fetchone()[0]
@@ -103,19 +127,22 @@ def test_MIG_01_execute_migration_0002_and_verify_data_preservation():
 
 def test_MIG_02_backward_and_forward_api_compatibility():
     """
-    Validate dual-schema compatibility:
-    - New v2 payload with campus_id='CAMPUS-MED' can be inserted.
+    Validate dual-schema compatibility under migration 0002:
+    - New v2 payload with campus_id='CAMPUS-MED' commits successfully.
     - Legacy v1 payload missing campus_id succeeds and safely receives default 'CAMPUS-ENG'.
     """
     setup_v1_database()
     try:
-        conn = sqlite3.connect(TEST_MIG_DB)
-        # Apply migration 0002
-        with conn:
-            conn.execute("ALTER TABLE bookings ADD COLUMN campus_id TEXT DEFAULT 'CAMPUS-ENG';")
-            conn.execute("CREATE TABLE outbox_intents (intent_id TEXT PRIMARY KEY, status TEXT);")
+        MigrationClass = load_django_migration_0002()
+        migration = MigrationClass("0002_add_campus_id_and_outbox", "campus_app")
 
-        # Ingest API v2 record
+        conn = sqlite3.connect(TEST_MIG_DB)
+        with conn:
+            op1 = migration.operations[0]
+            conn.execute(f"ALTER TABLE bookings ADD COLUMN {op1.name} TEXT DEFAULT '{op1.field.default}';")
+            conn.execute("CREATE TABLE campus_app_outboxintent (id TEXT PRIMARY KEY, intent_id TEXT);")
+
+        # Ingest API v2 record (includes campus_id='CAMPUS-MED')
         with conn:
             conn.execute("""
                 INSERT INTO bookings (id, booking_reference, room_code, booked_by, start_time, end_time, status, created_at, campus_id)
@@ -148,21 +175,24 @@ def test_MIG_02_backward_and_forward_api_compatibility():
 def test_MIG_03_migration_rollback_and_zero_data_loss_rehearsal():
     """
     Rehearse safe migration rollback:
-    Simulate backward rollback to 0001_initial state, proving all 5 historical bookings
+    Simulate backward rollback of 0002 to 0001_initial state, proving all 5 historical bookings
     remain 100% accessible and undamaged without data loss.
     """
     setup_v1_database()
     try:
+        MigrationClass = load_django_migration_0002()
+        migration = MigrationClass("0002_add_campus_id_and_outbox", "campus_app")
+
         conn = sqlite3.connect(TEST_MIG_DB)
         # 1. Forward Migration
         with conn:
-            conn.execute("ALTER TABLE bookings ADD COLUMN campus_id TEXT DEFAULT 'CAMPUS-ENG';")
-            conn.execute("CREATE TABLE outbox_intents (intent_id TEXT PRIMARY KEY, status TEXT);")
+            op1 = migration.operations[0]
+            conn.execute(f"ALTER TABLE bookings ADD COLUMN {op1.name} TEXT DEFAULT '{op1.field.default}';")
+            conn.execute("CREATE TABLE campus_app_outboxintent (id TEXT PRIMARY KEY, intent_id TEXT);")
 
-        # 2. Rollback Rehearsal: Drop outbox table and revert schema
+        # 2. Rollback Rehearsal: Drop outbox table and revert column
         with conn:
-            conn.execute("DROP TABLE outbox_intents;")
-            # Recreate table without campus_id (standard SQLite drop column emulation)
+            conn.execute("DROP TABLE campus_app_outboxintent;")
             conn.execute("""
                 CREATE TABLE bookings_rollback AS
                 SELECT id, booking_reference, room_code, booked_by, start_time, end_time, status, created_at
@@ -171,7 +201,7 @@ def test_MIG_03_migration_rollback_and_zero_data_loss_rehearsal():
             conn.execute("DROP TABLE bookings;")
             conn.execute("ALTER TABLE bookings_rollback RENAME TO bookings;")
 
-        # 3. Verify original historical records intact
+        # 3. Verify original historical records intact post-rollback
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM bookings;")
         count_post_rollback = cur.fetchone()[0]

@@ -4,14 +4,26 @@ Author: KANDUKURI VIJAY BHASKAR REDDY (Reg No: 192425155)
 Course: CSA10 - Software Engineering | CO4: Release Verification & Quality Gates
 """
 
-import pytest
 import urllib.request
 import urllib.error
 import json
 import uuid
 import time
+import base64
+import hashlib
+import hmac
 
 BASE_URL = "http://localhost/api"
+SECRET_SIGNING_KEY = b"campus-platform-secure-jwt-hmac-key-2026"
+
+
+def generate_signed_jwt_token(role="STUDENT", user_id="192425155"):
+    """Generates a cryptographic Bearer token with HMAC-SHA256 signature for authentic identity verification."""
+    payload = json.dumps({"role": role, "user_id": user_id, "iss": "campus-auth-service"})
+    b64 = base64.b64encode(payload.encode("utf-8")).decode("utf-8")
+    sig = hmac.new(SECRET_SIGNING_KEY, b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"Bearer {b64}.{sig}"
+
 
 def _http_request(endpoint, method="GET", data=None, custom_headers=None):
     url = f"{BASE_URL}/{endpoint.lstrip('/')}"
@@ -110,7 +122,14 @@ def test_LP3_live_optimistic_locking_stale_version_409():
 
 
 def test_LP4_live_rbac_student_approval_denial_403():
-    """Verify cryptographic RBAC: unverified forged headers rejected, student role denied approval, body spoofing ignored, booking stays Pending"""
+    """
+    Verify cryptographic RBAC:
+    - Direct header assertion without token is rejected or stripped.
+    - Genuine authenticated student token (Bearer) is verified by the server.
+    - Client request body privilege spoofing is ignored.
+    - Student approval is denied with HTTP 403 ERR_UNAUTHORIZED_APPROVAL.
+    - Database booking state remains strictly in 'PENDING'.
+    """
     # 1. Fetch available rooms
     _, rooms = _http_request("/rooms/")
     room_code = rooms[0]["room_code"]
@@ -129,18 +148,26 @@ def test_LP4_live_rbac_student_approval_denial_403():
 
     # 3. Forged Header Test: Direct unsigned X-User-Role: ADMIN header rejected with ERR_FORGED_ROLE_HEADER
     forged_headers = {"X-User-Role": "ADMIN"}
-    status_forged, body_forged = _http_request(f"/bookings/{target_id}/approve/", method="POST", data={"approver_name": "attacker"}, custom_headers=forged_headers)
+    status_forged, body_forged = _http_request(
+        f"/bookings/{target_id}/approve/", method="POST", data={"approver_name": "attacker"}, custom_headers=forged_headers
+    )
     assert status_forged == 403
     assert body_forged.get("error") == "ERR_FORGED_ROLE_HEADER"
 
-    # 4. Student attempts approval while spoofing body with user_role: FACILITY_MANAGER
-    # Server derives role strictly from trusted identity context, ignoring client body spoofing
+    # 4. Genuine Authenticated Student Test:
+    # Nginx strips client-supplied X-User-Role headers, so the request carries a genuine
+    # cryptographic Bearer token proving authenticated student identity.
+    # Server derives role strictly from trusted identity context, ignoring client body spoofing.
     spoofed_payload = {
         "user_role": "FACILITY_MANAGER",  # Spoof attempt in body!
         "approver_name": "student_attacker_192425155"
     }
-    student_headers = {"X-User-Role": "STUDENT"}
-    status_code, body = _http_request(f"/bookings/{target_id}/approve/", method="POST", data=spoofed_payload, custom_headers=student_headers)
+    student_headers = {
+        "Authorization": generate_signed_jwt_token(role="STUDENT", user_id="student_192425155")
+    }
+    status_code, body = _http_request(
+        f"/bookings/{target_id}/approve/", method="POST", data=spoofed_payload, custom_headers=student_headers
+    )
     assert status_code == 403
     assert body.get("error") == "ERR_UNAUTHORIZED_APPROVAL"
     assert "FACILITY_MANAGER" in body.get("authorized_roles", [])
